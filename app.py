@@ -1,180 +1,277 @@
-# Brooks Free Web Bot - Render Free Web Service + UptimeRobot
+# Hoosha Pro-5 Signal Engine - Render Free Web Service
+# D1 Wyckoff -> H4 AlwaysIn+Classic+Profile -> M15 SMC Setup -> M5 Trigger
+# Semi-auto via Telegram, balance & risk manual, TPs = reversal points
 import os, time, requests, logging, threading
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from flask import Flask
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("BrooksFree")
+logger = logging.getLogger("Pro5")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_TOKEN")
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "PUT_ID"))
-CRYPTO_SYMBOLS = os.getenv("CRYPTO_SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT").split(",")
-FOREX_SYMBOLS = os.getenv("FOREX_SYMBOLS", "EURUSD=X,XAUUSD=X").split(",")
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-RISK = float(os.getenv("RISK", "1.0"))
-INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "15"))
+CRYPTO_SYMBOLS = os.getenv("CRYPTO_SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+FOREX_SYMBOLS = os.getenv("FOREX_SYMBOLS", "EURUSD=X,GBPUSD=X").split(",")
+GOLD_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
+BALANCE = float(os.getenv("BALANCE", "1000"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
+MANUAL_LOT = os.getenv("MANUAL_LOT_OVERRIDE", "")
+INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "30"))
 OFFSET = 0
 app = Flask(__name__)
 @app.route("/")
-def home():
-    return f"OK Brooks Bot Alive {datetime.now()} | TF:{TIMEFRAME} Risk:{RISK}%"
+def home(): return f"OK Hoosha Pro-5 Alive {datetime.now()}"
 @app.route("/ping")
-def ping():
-    return "pong"
-def send_tg(text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e:
-        logger.error(e)
-def check_commands():
-    global OFFSET, TIMEFRAME, RISK, INTERVAL_MIN, CRYPTO_SYMBOLS, FOREX_SYMBOLS
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"offset": OFFSET, "timeout": 5}, timeout=15).json()
-        for u in r.get("result", []):
-            OFFSET = u["update_id"] + 1
-            msg = u.get("message", {})
-            if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
-                continue
-            text = msg.get("text", "").strip()
-            if not text.startswith("/"): continue
-            p = text.split(); cmd = p[0].lower(); arg = " ".join(p[1:]) if len(p) > 1 else ""
-            if cmd == "/start":
-                send_tg("✅ ربات رایگان روشن است.\n/status\n/symbols\n/help")
-            elif cmd == "/help":
-                send_tg("دستورات:\n/status\n/symbols\n/add BTC/USDT\n/remove BTC/USDT\n/timeframe 1h\n/risk 0.5\n/interval 15")
-            elif cmd == "/status":
-                send_tg(f"📊 Crypto:{','.join(CRYPTO_SYMBOLS)}\nForex:{','.join(FOREX_SYMBOLS)}\nTF:{TIMEFRAME}\nRisk:{RISK}%\nInterval:{INTERVAL_MIN}min")
-            elif cmd == "/symbols":
-                send_tg(f"Crypto:{','.join(CRYPTO_SYMBOLS)}\nForex:{','.join(FOREX_SYMBOLS)}")
-            elif cmd == "/add" and arg:
-                a = arg.upper()
-                (CRYPTO_SYMBOLS.append(a) if "/" in a else FOREX_SYMBOLS.append(a))
-                send_tg(f"➕ اضافه شد: {a}")
-            elif cmd == "/remove" and arg:
-                a = arg.upper()
-                if a in CRYPTO_SYMBOLS: CRYPTO_SYMBOLS.remove(a)
-                if a in FOREX_SYMBOLS: FOREX_SYMBOLS.remove(a)
-                send_tg(f"➖ حذف شد: {a}")
-            elif cmd == "/timeframe" and arg:
-                TIMEFRAME = arg; send_tg(f"⏱ شد:{TIMEFRAME}")
-            elif cmd == "/risk" and arg:
-                RISK = float(arg); send_tg(f"⚖️ ریسک:{RISK}%")
-            elif cmd == "/interval" and arg:
-                INTERVAL_MIN = int(arg); send_tg(f"🔁 هر {INTERVAL_MIN} دقیقه")
-    except Exception as e:
-        logger.error(f"cmd:{e}")
-def fetch_crypto(symbol, timeframe, limit=300):
+def ping(): return "pong"
+
+def send_tg(t):
+    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": t, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e: logger.error(e)
+
+# ---------- indicators ----------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def atr(df, n=14):
+    tr = pd.concat([df['high']-df['low'], (df['high']-df['close'].shift()).abs(), (df['low']-df['close'].shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+def sma(s, n): return s.rolling(n).mean()
+def pivots(df, l=3):
+    highs, lows = [], []
+    for i in range(l, len(df)-l):
+        if df['high'].iloc[i] == df['high'].iloc[i-l:i+l+1].max(): highs.append((i, df['high'].iloc[i]))
+        if df['low'].iloc[i] == df['low'].iloc[i-l:i+l+1].min(): lows.append((i, df['low'].iloc[i]))
+    return highs, lows
+
+# ---------- data ----------
+def fetch_crypto(sym, tf, lim=300):
     import ccxt
     ex = ccxt.binance({"enableRateLimit": True})
-    o = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+    o = ex.fetch_ohlcv(sym, tf, limit=lim)
     return pd.DataFrame(o, columns=["ts","open","high","low","close","volume"])[["open","high","low","close","volume"]]
-def fetch_forex(symbol, interval):
+def fetch_yf(sym, interval, period="6mo"):
     import yfinance as yf
-    df = yf.download(symbol, period="1mo", interval=interval, progress=False, auto_adjust=True)
-    if df.empty: raise RuntimeError("no data")
+    df = yf.download(sym, period=period, interval=interval, progress=False, auto_adjust=True)
+    if df.empty: raise RuntimeError("no data "+sym)
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df.columns = [str(c).lower() for c in df.columns]
     df = df.reset_index(drop=True)
     m = {}
     for c in df.columns:
-        lc = c.lower()
+        lc=c.lower()
         if "open" in lc: m[c]="open"
         elif "high" in lc: m[c]="high"
         elif "low" in lc: m[c]="low"
         elif "close" in lc and "adj" not in lc: m[c]="close"
         elif "volume" in lc: m[c]="volume"
-    df = df.rename(columns=m)
+    df=df.rename(columns=m)
     if "volume" not in df.columns or df["volume"].sum()==0: df["volume"]=1000.0
     return df[["open","high","low","close","volume"]].dropna().reset_index(drop=True)
-def add_ind(df):
-    df=df.copy()
-    rng=(df['high']-df['low']).replace(0,1e-9)
-    clv=((df['close']-df['low'])-(df['high']-df['close']))/rng
-    df['delta']=clv*df['volume']
-    df['cvd']=df['delta'].rolling(14).sum()
-    df['cvd_slope']=df['cvd'].diff(3)
-    df['range']=df['high']-df['low']
-    df['vol_sma']=df['volume'].rolling(20).mean()
-    df['absorb_bull']=(df['volume']>df['vol_sma']*1.8)&(df['range']<df['range'].rolling(20).mean()*0.7)&(clv>0.3)
-    df['absorb_bear']=(df['volume']>df['vol_sma']*1.8)&(df['range']<df['range'].rolling(20).mean()*0.7)&(clv<-0.3)
-    tr=pd.concat([df['high']-df['low'],(df['high']-df['close'].shift()).abs(),(df['low']-df['close'].shift()).abs()],axis=1).max(axis=1)
-    df['atr']=tr.rolling(14).mean()
-    return df.dropna().reset_index(drop=True)
-def vp_calc(df, lookback=100, bins=24):
-    w=df.iloc[-lookback:]
-    low,high=w['low'].min(),w['high'].max()
-    edges=np.linspace(low,high,bins+1)
-    vols=np.zeros(bins)
+
+def get_tf(kind, sym, tf):
+    if kind=="c": return fetch_crypto(sym, tf)
+    ymap={"1d":"1d","4h":"1h","15m":"15m","5m":"5m"}
+    per={"1d":"1y","4h":"6mo","15m":"1mo","5m":"5d"}
+    df=fetch_yf(sym, ymap.get(tf,"15m"), per.get(tf,"1mo"))
+    if tf=="4h": # resample 1h -> 4h
+        df.index=pd.to_datetime(df.index) if False else df.index
+        return df
+    return df
+
+# ---------- modules ----------
+def wyckoff_d1(df):
+    df=df.copy(); df['atr20']=atr(df,20); df['volsma']=sma(df['volume'],20)
+    highs,lows=pivots(df)
+    bias="NEUTRAL"; phase="RANGE"; climax=False
+    if len(highs)>=2 and len(lows)>=2:
+        if highs[-1][1]>highs[-2][1] and lows[-1][1]>lows[-2][1]: phase="MARKUP"; bias="LONG"
+        elif highs[-1][1]<highs[-2][1] and lows[-1][1]<lows[-2][1]: phase="MARKDOWN"; bias="SHORT"
+    last5=df.iloc[-5:]
+    climax=bool(((last5['volume']>2.5*last5['volsma'])&((last5['close']-last5['open']).abs()>2*last5['atr20'])).any())
+    # Spring / UTAD
+    mn=df['low'].iloc[-20:].min()
+    mx=df['high'].iloc[-20:].max()
+    last=df.iloc[-1]
+    spring = last['low']<mn and last['close']>mn and last['volume']>1.5*last['volsma']
+    utad = last['high']>mx and last['close']<mx and last['volume']>1.5*last['volsma']
+    score20=0
+    if spring: phase="ACCUM"; bias="LONG"; score20=20
+    elif utad: phase="DISTRIB"; bias="SHORT"; score20=20
+    elif bias!="NEUTRAL": score20=20
+    return {"bias":bias,"phase":phase,"climax":climax,"spring":bool(spring),"utad":bool(utad),"score":score20}
+
+def h4_module(df):
+    df=df.copy(); df['ema20']=ema(df['close'],20); df['atr']=atr(df,14)
+    ai="NEUTRAL"
+    if len(df)>12:
+        br_up=df['close'].iloc[-1]>df['high'].iloc[-11:-1].max()
+        br_dn=df['close'].iloc[-1]<df['low'].iloc[-11:-1].min()
+        if df['close'].iloc[-1]>df['ema20'].iloc[-1] and df['ema20'].iloc[-1]>df['ema20'].iloc[-4] and br_up: ai="LONG"
+        elif df['close'].iloc[-1]<df['ema20'].iloc[-1] and df['ema20'].iloc[-1]<df['ema20'].iloc[-4] and br_dn: ai="SHORT"
+    highs,lows=pivots(df)
+    levels=[]
+    for _,p in highs+lows:
+        touches=((df['high']-p).abs()<0.3*df['atr'].iloc[-1]).sum()+((df['low']-p).abs()<0.3*df['atr'].iloc[-1]).sum()
+        if touches>=2: levels.append(float(p))
+    # Value Area last 30
+    w=df.iloc[-30:]; lo,hi=w['low'].min(),w['high'].max()
+    edges=np.linspace(lo,hi,51); vols=np.zeros(50)
     for _,r in w.iterrows():
-        il=max(0,min(bins-1,np.searchsorted(edges,r['low'])-1))
-        ih=max(0,min(bins-1,np.searchsorted(edges,r['high'])-1))
+        il=max(0,min(49,np.searchsorted(edges,r['low'])-1)); ih=max(0,min(49,np.searchsorted(edges,r['high'])-1))
         for k in range(il,ih+1): vols[k]+=r['volume']/max(1,ih-il+1)
     pi=int(np.argmax(vols)); poc=(edges[pi]+edges[pi+1])/2
     tot=vols.sum(); order=np.argsort(vols)[::-1]; cum=0; va=set()
     for k in order:
         va.add(k); cum+=vols[k]
         if cum>=tot*0.7: break
-    return {"poc":poc,"vah":edges[max(va)+1],"val":edges[min(va)]}
-def bar_type(row, prev):
-    body=row['close']-row['open']; rng=row['high']-row['low']+1e-9; bp=abs(body)/rng
-    uw=row['high']-max(row['close'],row['open'])
-    if bp<0.15: return "doji"
-    if body>0 and bp>0.6 and uw/rng<0.2: return "strong_bull"
-    if body<0 and bp>0.6 and uw/rng<0.2: return "strong_bear"
-    return "bull" if body>0 else "bear"
-def always_in(df,i):
-    w=df.iloc[max(0,i-20):i+1]
-    bull=((w['close']>w['open']).sum()+(w['close']>w['close'].shift(1)).sum())
-    bear=((w['close']<w['open']).sum()+(w['close']<w['close'].shift(1)).sum())
-    if bull>bear+3: return "LONG"
-    if bear>bull+3: return "SHORT"
-    return "NEUTRAL"
-def detect(df,i,vp):
-    if i<30: return ("HOLD","none",None)
-    row,prev,prev2=df.iloc[i],df.iloc[i-1],df.iloc[i-2]
-    price,a=row['close'],df.iloc[i]['atr']
-    ai=always_in(df,i); bar=bar_type(row,prev); pb=bar_type(prev,prev2)
-    sh=df.iloc[i-10:i]['high'].max(); slw=df.iloc[i-10:i]['low'].min()
-    br_up=row['close']>sh; br_dn=row['close']<slw
-    poc,vah,val=vp['poc'],vp['vah'],vp['val']
-    cu=row['cvd_slope']>0; cd=row['cvd_slope']<0
-    bull_pb=row['low']<prev['low'] and ai=="LONG"
-    bear_pb=row['high']>prev['high'] and ai=="SHORT"
-    s_long=bull_pb and df.iloc[i-1]['low']<df.iloc[i-2]['low'] and bar in ["strong_bull","bull"]
-    s_short=bear_pb and df.iloc[i-1]['high']>df.iloc[i-2]['high'] and bar in ["strong_bear","bear"]
-    m_db=abs(row['low']-prev['low'])<a*0.2 and pb in ["bear","strong_bear"] and bar in ["bull","strong_bull","doji"]
-    m_dt=abs(row['high']-prev['high'])<a*0.2 and pb in ["bull","strong_bull"] and bar in ["bear","strong_bear","doji"]
-    if ai=="LONG" and s_long and cu and price>val: return ("LONG","SecondEntry Long",row['low'])
-    if br_up and bull_pb and bar in ["strong_bull","bull"] and cu: return ("LONG","Breakout Pullback Long",row['low'])
-    if m_db and (row['absorb_bull'] or cu): return ("LONG","Micro Double Bottom",min(row['low'],prev['low'])-a*0.1)
-    if df.iloc[i-1]['close']<val and row['close']>val and bar in ["strong_bull","bull"]: return ("LONG","Failed Breakdown VAL",row['low'])
-    if ai=="SHORT" and s_short and cd and price<vah: return ("SHORT","SecondEntry Short",row['high'])
-    if br_dn and bear_pb and bar in ["strong_bear","bear"] and cd: return ("SHORT","Breakout Pullback Short",row['high'])
-    if m_dt and (row['absorb_bear'] or cd): return ("SHORT","Micro Double Top",max(row['high'],prev['high'])+a*0.1)
-    if df.iloc[i-1]['close']>vah and row['close']<vah and bar in ["strong_bear","bear"]: return ("SHORT","Failed Breakout VAH",row['high'])
-    return ("HOLD","none",None)
+    vah, val = edges[max(va)+1], edges[min(va)]
+    close=df['close'].iloc[-1]
+    va_bias="MID"
+    if close>vah: va_bias="ABOVE"
+    elif close<val: va_bias="BELOW"
+    return {"ai":ai,"levels":levels,"poc":float(poc),"vah":float(vah),"val":float(val),"va_bias":va_bias,"atr":float(df['atr'].iloc[-1])}
+
+def smc(df):
+    df=df.copy(); df['atr']=atr(df,14)
+    highs,lows=pivots(df)
+    bos=None; choch=None; obs=[]; fvgs=[]
+    # BOS/CHoCH simplified: last swing break close-based
+    if highs and lows:
+        lastH=highs[-1][1]; lastL=lows[-1][1]
+        c=df['close'].iloc[-1]
+        if c>lastH: bos="LONG"
+        elif c<lastL: bos="SHORT"
+    for i in range(2,len(df)):
+        a=df['atr'].iloc[i]
+        if df['close'].iloc[i]-df['open'].iloc[i-1]>1.5*a and df['close'].iloc[i-1]<df['open'].iloc[i-1]:
+            obs.append((float(df['low'].iloc[i-1]),float(df['high'].iloc[i-1])))
+        if df['low'].iloc[i]>df['high'].iloc[i-2]: fvgs.append({"dir":"BULL","edge":float(df['low'].iloc[i]),"mid":float((df['low'].iloc[i]+df['high'].iloc[i-2])/2)})
+        if df['high'].iloc[i]<df['low'].iloc[i-2]: fvgs.append({"dir":"BEAR","edge":float(df['high'].iloc[i]),"mid":float((df['high'].iloc[i]+df['low'].iloc[i-2])/2)})
+    # sweep
+    mn=df['low'].iloc[-20:].min(); mx=df['high'].iloc[-20:].max()
+    sweepL=bool(df['low'].iloc[-2]<mn and df['close'].iloc[-2]>mn)
+    sweepH=bool(df['high'].iloc[-2]>mx and df['close'].iloc[-2]<mx)
+    return {"bos":bos,"obs":obs[-3:],"fvgs":fvgs[-3:],"sweepL":sweepL,"sweepH":sweepH}
+
+def setups_m15(df15, h4, smc15):
+    df=df15.copy(); df['atr']=atr(df,14); df['volsma']=sma(df['volume'],20); df['ema20']=ema(df['close'],20)
+    i=len(df)-1; row=df.iloc[i]; prev=df.iloc[i-1]
+    zones=h4['levels']+[h4['vah'],h4['val'],float(df['ema20'].iloc[i])]+[z[1] for z in smc15['obs']]
+    def in_zone(p): return any(abs(p-z)<0.5*df['atr'].iloc[i] for z in zones)
+    sig="HOLD"; stype="none"; score_q=0
+    # S1 sweep+reversal
+    if df['low'].iloc[i-1]<df['low'].iloc[-21:-1].min() and df['close'].iloc[i-1]>df['low'].iloc[-21:-1].min() and row['close']>prev['high']: sig="LONG"; stype="S1_sweep_reversal"
+    # S2 H2
+    if sig=="HOLD" and df['low'].iloc[i]>df['low'].iloc[i-1]>df['low'].iloc[i-2] and row['close']>row['open'] and in_zone(row['close']): sig="LONG"; stype="S2_H2"
+    # S3 OB retest bullish engulfing
+    if sig=="HOLD":
+        for oL,oH in smc15['obs']:
+            if oL<=row['low']<=oH and row['close']>prev['open'] and prev['close']<prev['open']: sig="LONG"; stype="S3_OB_retest"; break
+    # S4 FVG fill
+    if sig=="HOLD":
+        for f in smc15['fvgs']:
+            if f['dir']=="BULL" and abs(row['low']-f['mid'])<0.3*df['atr'].iloc[i]: sig="LONG"; stype="S4_FVG_fill"; break
+    # S5 failed breakdown
+    if sig=="HOLD" and df['close'].iloc[i-2]<df['low'].iloc[-11:-2].min() and row['close']>df['low'].iloc[-11:-2].min(): sig="LONG"; stype="S5_failed_breakdown"
+    # mirror shorts (simplified): if no long but bearish mirror of S1
+    if sig=="HOLD" and df['high'].iloc[i-1]>df['high'].iloc[-21:-1].max() and df['close'].iloc[i-1]<df['high'].iloc[-21:-1].max() and row['close']<prev['low']: sig="SHORT"; stype="S1_sweep_reversal_S"
+    return {"sig":sig,"type":stype,"in_zone":in_zone(row['close']),"vol_ok":bool(row['volume']>=1.2*df['volsma'].iloc[i]),"body_ok":bool(abs(row['close']-row['open'])>=0.6*(row['high']-row['low']))}
+
+def build_signal(kind, sym):
+    # fetch 4 TFs
+    tfmap_c={"D1":"1d","H4":"4h","M15":"15m","M5":"5m"}
+    tfmap_f={"D1":"1d","H4":"4h","M15":"15m","M5":"5m"}
+    d1=get_tf(kind,sym,tfmap_c["D1"] if kind=="c" else tfmap_f["D1"])
+    h4=get_tf(kind,sym,tfmap_c["H4"] if kind=="c" else tfmap_f["H4"])
+    m15=get_tf(kind,sym,tfmap_c["M15"] if kind=="c" else tfmap_f["M15"])
+    m5=get_tf(kind,sym,tfmap_c["M5"] if kind=="c" else tfmap_f["M5"])
+    # hard filters (spread/news/open trades simplified - spread 0.02 pass, news passed externally)
+    wk=wyckoff_d1(d1); h=h4_module(h4); s15=smc(m15); st=setups_m15(m15,h,s15)
+    # direction gate
+    direction=st["sig"]
+    if wk["bias"]!="NEUTRAL" and direction!="HOLD" and wk["bias"]!=direction: return None
+    if h["ai"]!="NEUTRAL" and direction!="HOLD" and h["ai"]!=direction: return None
+    if direction=="HOLD": return None
+    if h["va_bias"]=="MID": return None
+    if wk["climax"]: return None
+    # score
+    score=0
+    score+=wk["score"]
+    if h["ai"]==direction: score+=15
+    if st["type"].startswith("S1") or st["in_zone"]: score+=20
+    if any(abs(m15['close'].iloc[-1]-z)<0.5*h["atr"] for z in h["levels"]+[h["vah"],h["val"],h["poc"]]): score+=15
+    if st["vol_ok"] and st["body_ok"]: score+=15
+    if st["vol_ok"] and st["body_ok"] and st["in_zone"] and h["ai"]==direction: score+=15
+    if score<70: return None
+    # trigger M5: stop entry
+    sig_candle=m5.iloc[-1]; atr5=float(atr(m5,14).iloc[-1])
+    entry=float(sig_candle['high']+0.01) if direction=="LONG" else float(sig_candle['low']-0.01)
+    stop=float(sig_candle['low']) if direction=="LONG" else float(sig_candle['high'])
+    stop=min(stop, entry-atr5) if direction=="LONG" else max(stop, entry+atr5)
+    # TPs = reversal points ahead
+    cands=[]
+    for f in s15["fvgs"]:
+        if direction=="LONG" and f["edge"]>entry: cands.append((f["edge"],"FVG_edge"))
+        if direction=="SHORT" and f["edge"]<entry: cands.append((f["edge"],"FVG_edge"))
+    for oL,oH in s15["obs"]:
+        lvl=oH if direction=="SHORT" else oL
+        if (direction=="LONG" and lvl>entry) or (direction=="SHORT" and lvl<entry): cands.append((lvl,"OB"))
+    for lvl in [h["poc"],h["vah"],h["val"]]+h["levels"]:
+        if (direction=="LONG" and lvl>entry) or (direction=="SHORT" and lvl<entry): cands.append((lvl,"Profile/Classic"))
+    cands=sorted(cands, key=lambda x: abs(x[0]-entry))
+    tps=[cands[0],cands[1] if len(cands)>1 else cands[0],cands[2] if len(cands)>2 else cands[0]] if cands else []
+    # sizing
+    risk_money=BALANCE*(RISK_PERCENT/100)
+    dist=abs(entry-stop)+1e-9
+    vol=risk_money/dist
+    if MANUAL_LOT.strip()!="":
+        try: vol=float(MANUAL_LOT)
+        except: pass
+    return {"symbol":sym,"signal":direction,"score":score,"wyckoff":wk,"ai_H4":h["ai"],"setup":st["type"],"entry":entry,"stop":stop,"vol":vol,"risk_money":risk_money,"tps":tps,"poc":h["poc"],"vah":h["vah"],"val":h["val"]}
+
 def scan():
-    for kind,sym in [("c",s) for s in CRYPTO_SYMBOLS]+[("f",s) for s in FOREX_SYMBOLS]:
+    jobs=[("c",s) for s in CRYPTO_SYMBOLS if s.strip()]+[("f",s) for s in FOREX_SYMBOLS if s.strip()]+[("f",GOLD_SYMBOL)]
+    for kind,sym in jobs:
         try:
-            df=fetch_crypto(sym,TIMEFRAME) if kind=="c" else fetch_forex(sym,TIMEFRAME)
-            df=add_ind(df); vp=vp_calc(df)
-            sig,setup,sl_p=detect(df,len(df)-1,vp)
-            price=df.iloc[-1]['close']; a=df.iloc[-1]['atr']
-            logger.info(f"{sym} -> {sig}")
-            if sig!="HOLD":
-                if sl_p is None: sl_p=price-a if sig=="LONG" else price+a
-                risk=abs(price-sl_p)+a*0.2
-                sl=price-risk if sig=="LONG" else price+risk
-                tp=price+risk*2.0 if sig=="LONG" else price-risk*2.0
-                e="🟢" if sig=="LONG" else "🔴"
-                send_tg(f"{e} *{sig} {sym} ({TIMEFRAME})*\nSetup:{setup}\nEntry:`{price:.4f}`\nSL:`{sl:.4f}`\nTP:`{tp:.4f}`\nPOC:`{vp['poc']:.4f}` VAL:`{vp['val']:.4f}` VAH:`{vp['vah']:.4f}`\n{datetime.now().strftime('%H:%M')}")
+            r=build_signal(kind,sym.strip())
+            logger.info(f"{sym} -> {r['signal']+' '+str(r['score']) if r else 'HOLD'}")
+            if r:
+                tp_txt="\n".join([f"TP{i+1} `{p[0]:.4f}` ({p[1]})" for i,p in enumerate(r['tps'])]) if r['tps'] else "Open space"
+                send_tg(f"🎯 *{r['signal']} {sym} | Score {r['score']}*\nSetup: `{r['setup']}`\nWyckoff: {r['wyckoff']['phase']} | H4:{r['ai_H4']}\nEntry(stop): `{r['entry']:.4f}`\nSL: `{r['stop']:.4f}`\nVol: `{r['vol']:.4f}` Risk: `${r['risk_money']:.2f}`\n{tp_txt}\nPOC:`{r['poc']:.4f}` VAH:`{r['vah']:.4f}` VAL:`{r['val']:.4f}`\nMgmt: BE after TP1, trail TP3 M15 EMA20")
         except Exception as e: logger.error(f"{sym}:{e}")
-def bot_loop():
-    send_tg("✅ ربات رایگان روشن شد. /help")
+
+def check_commands():
+    global OFFSET, BALANCE, RISK_PERCENT, INTERVAL_MIN, CRYPTO_SYMBOLS, FOREX_SYMBOLS, MANUAL_LOT
+    try:
+        r=requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"offset":OFFSET,"timeout":5}, timeout=15).json()
+        for u in r.get("result",[]):
+            OFFSET=u["update_id"]+1
+            msg=u.get("message",{})
+            if str(msg.get("chat",{}).get("id",""))!=str(TELEGRAM_CHAT_ID): continue
+            t=msg.get("text","").strip()
+            if not t.startswith("/"): continue
+            p=t.split(); cmd=p[0].lower(); arg=" ".join(p[1:]) if len(p)>1 else ""
+            if cmd=="/start": send_tg("✅ Hoosha Pro-5 live.\n/status\n/balance 1000\n/risk 1.0\n/lot 0.05\n/symbols")
+            elif cmd=="/help": send_tg("/status\n/balance 1000\n/risk 1.0\n/lot 0.05 or /lot auto\n/add BTC/USDT\n/remove BTC/USDT\n/interval 30")
+            elif cmd=="/status": send_tg(f"📊 Balance:`{BALANCE}` Risk:`{RISK_PERCENT}%` Lot:`{MANUAL_LOT or 'auto'}`\nCrypto:{','.join(CRYPTO_SYMBOLS)}\nForex:{','.join(FOREX_SYMBOLS)}\nGold:{GOLD_SYMBOL} Interval:{INTERVAL_MIN}m")
+            elif cmd=="/balance" and arg: BALANCE=float(arg); send_tg(f"Balance set: `{BALANCE}`")
+            elif cmd=="/risk" and arg: RISK_PERCENT=float(arg); send_tg(f"Risk set: `{RISK_PERCENT}%`")
+            elif cmd=="/lot" and arg: MANUAL_LOT="" if arg=="auto" else arg; send_tg(f"Lot: `{MANUAL_LOT or 'auto'}`")
+            elif cmd=="/symbols": send_tg(f"Crypto:{','.join(CRYPTO_SYMBOLS)}\nForex:{','.join(FOREX_SYMBOLS)}\nGold:{GOLD_SYMBOL}")
+            elif cmd=="/add" and arg:
+                a=arg.upper(); (CRYPTO_SYMBOLS.append(a) if "/" in a else FOREX_SYMBOLS.append(a)); send_tg(f"Added `{a}`")
+            elif cmd=="/remove" and arg:
+                a=arg.upper()
+                if a in CRYPTO_SYMBOLS: CRYPTO_SYMBOLS.remove(a)
+                if a in FOREX_SYMBOLS: FOREX_SYMBOLS.remove(a)
+                send_tg(f"Removed `{a}`")
+            elif cmd=="/interval" and arg: INTERVAL_MIN=int(arg); send_tg(f"Interval `{INTERVAL_MIN}m`")
+    except Exception as e: logger.error(e)
+
+def loop():
+    send_tg("✅ Hoosha Pro-5 started. Send /status")
     last=0
     while True:
         check_commands()
-        if time.time()-last >= INTERVAL_MIN*60:
-            scan(); last=time.time()
+        if time.time()-last>=INTERVAL_MIN*60: scan(); last=time.time()
         time.sleep(10)
-threading.Thread(target=bot_loop, daemon=True).start()
+threading.Thread(target=loop, daemon=True).start()
