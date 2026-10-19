@@ -20,7 +20,7 @@ INDEX_SYMBOLS = os.getenv("INDEX_SYMBOLS", "US500").split(",")
 BALANCE = float(os.getenv("BALANCE", "1000"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))
 INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "30"))
-WATCH_MODE = os.getenv("WATCH_MODE", "0") == "1"   # 1 = demo/watch tags, no live label
+WATCH_MODE = os.getenv("WATCH_MODE", "0") == "1"
 NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1") == "1"
 NEWS_BLOCK_MINUTES = int(os.getenv("NEWS_BLOCK_MINUTES", "30"))
 NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -34,13 +34,12 @@ ANALYZED = set()
 TRADE_COUNT = {}
 LAST_SIGNAL_TIME = {}
 
-# ---------- v6 backtest-verified config (45d, no spread/slip) ----------
 TP_R = [1.3, 2.0, 3.0]
 TP_ALLOC = [0.5, 0.3, 0.2]
 SL_ATR_MULT = 1.5
-ENTRY_TIMEOUT_MIN = 24 * 5     # 24 M5 bars = 2h
-TRADE_TIMEOUT_MIN = 288 * 5    # 288 M5 bars = 24h
-CLASS_SETUP_DISABLE = {"*": ["utad_fvg"]}                # utad+FVG combo removed everywhere (backtest loser)
+ENTRY_TIMEOUT_MIN = 24 * 5
+TRADE_TIMEOUT_MIN = 288 * 5
+CLASS_SETUP_DISABLE = {"*": ["utad_fvg"]}
 SYMBOL_SETUP_DISABLE = {"GBPUSD": ["utad"], "USDCHF": ["spring"]}
 PRO6_CFG = {
     "EURUSD": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
@@ -83,7 +82,6 @@ def session_ok(cfg):
     if "12-20" in s: return 12 <= h < 20
     return True
 
-# ---------- NEWS (unchanged) ----------
 def fetch_news_cached(force=False):
     global NEWS_CACHE, NEWS_LAST_FETCH
     if not force and NEWS_CACHE and time.time()-NEWS_LAST_FETCH < 1800: return NEWS_CACHE
@@ -177,7 +175,6 @@ def upcoming_text():
     lines = [f"{dt.strftime('%m-%d %H:%M')} UTC - {ev.get('country')} {ev.get('title')}" for dt, ev in items]
     return "🗓 High-Impact this week:\n" + "\n".join(lines)
 
-# ---------- indicators ----------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def sma(s, n): return s.rolling(n).mean()
 def atr(df, n=14):
@@ -198,7 +195,6 @@ def efficiency_regime(df, n=10, thr=0.3):
     er = abs(c.iloc[-1]-c.iloc[-1-n]) / (c.diff().abs().iloc[-n:].sum() + 1e-9)
     return ("TREND" if er > thr else "RANGE"), float(er)
 
-# ---------- data (Yahoo chart API direct, no yfinance/ccxt) ----------
 def fetch_yahoo(sym, interval, rng):
     last_err = None
     for host in ("query1", "query2"):
@@ -237,7 +233,6 @@ def fetch_sym_tf(name, tf):
         if fb: return get_tf(fb, tf)
         raise
 
-# ---------- modules (same as backtest v6) ----------
 def wyckoff_d1(df):
     df = df.copy(); df['atr20'] = atr(df,20); df['volsma'] = sma(df['volume'],20)
     highs, lows = pivots_confirmed(df)
@@ -323,7 +318,6 @@ def detect_setup(df15, h4, s15, no_vol=False):
     body_ok = bool(abs(row['close']-row['open']) >= 0.6*(row['high']-row['low']))
     return {"sig":sig,"type":stype,"in_zone":in_zone(row['close']),"vol_ok":vol_ok,"body_ok":body_ok,"atr15":float(df['atr'].iloc[i])}
 
-# ---------- v6 setup filters (token matching fixed: event + combo) ----------
 def setup_allowed(name, prefix, event):
     token = f"{prefix}_{event}" if event != "none" else prefix
     for bad in CLASS_SETUP_DISABLE.get("*", []):
@@ -366,7 +360,6 @@ def build_signal(sym):
     if st["vol_ok"] and st["body_ok"]: score += 15
     if st["vol_ok"] and st["body_ok"] and st["in_zone"] and h["ai"] == direction: score += 15
     if score < cfg.get("score_thr",50): return None
-    # v6 execution model: stop-order entry on signal candle, SL = 1.5xATR(M5), fixed TP 1.3/2.0/3.0R
     sig_c = m5.iloc[-2]; atr5 = float(atr(m5,14).iloc[-2])
     if direction == "LONG":
         entry = float(sig_c['high']); stop = entry - SL_ATR_MULT*atr5
@@ -381,7 +374,6 @@ def build_signal(sym):
             "regime":h["regime"],"setup":st["type"],"entry":entry,"stop":stop,"R":rd,"tps":tps,"vol":vol,
             "risk_money":risk_money,"status":("WATCH" if WATCH_MODE else cfg.get("status","LIVE"))}
 
-# ---------- trade tracking (pro6_state.json) ----------
 def load_state():
     try:
         with open(STATE_FILE) as f: st = json.load(f)
@@ -414,7 +406,6 @@ def monitor_trades():
             logger.error(f"monitor {t['map']}: {e}"); continue
         opened = datetime.fromisoformat(t["opened_at"])
         age_min = (now - opened).total_seconds()/60
-        # pending stop-order entry, valid 24 M5 bars
         if not t["entered"]:
             if age_min > ENTRY_TIMEOUT_MIN:
                 st["open"].remove(t); st["closed"].append({**t, "result_r": 0.0, "why": "entry timeout"})
@@ -426,7 +417,6 @@ def monitor_trades():
                 send_tg(f"✅ Entry filled: {fmt(t)} @ `{t['entry']:.5f}`\nSL `{t['sl']:.5f}` | TP1/2/3 active (50/30/20)")
                 save_state(st)
             continue
-        # active trade: walk recent bars, SL-first (conservative)
         rec = m5.tail(60)
         closed = False
         for _, bar in rec.iterrows():
@@ -501,7 +491,7 @@ def scan():
                 LAST_SIGNAL_TIME[name] = now
                 register_trade(r)
                 tp_txt = "\n".join([f"TP{i+1} `{r['tps'][i]:.5f}` ({TP_R[i]}R, {int(TP_ALLOC[i]*100)}%)" for i in range(3)])
-                send_tg(f"🎯 *{r['signal']} {r['symbol']} [{r['status']}] | Score {r['score']}*\nSetup: `{r['setup']}` | Event: `{r['event']}`\nWyckoff: {r['wyckoff']['phase']} | H4:{r['ai_H4']} {r['regime']}\nEntry(stop-order, valid 2h): `{r['entry']:.5f}`\nSL: `{r['stop']:.5f}` (1.5xATR) | R: `{r['R']:.5f}`\n{tp_txt}\nSL→BE after TP1, SL→TP1 after TP2\nVol: `{r['vol']:.4f}` | Risk: `${r['risk_money']:.2f}`\nPOC:`{PRO6_CFG and 0:.1f}`".replace("POC:`0.0`",""))
+                send_tg(f"🎯 *{r['signal']} {r['symbol']} [{r['status']}] | Score {r['score']}*\nSetup: `{r['setup']}` | Event: `{r['event']}`\nWyckoff: {r['wyckoff']['phase']} | H4:{r['ai_H4']} {r['regime']}\nEntry(stop-order, valid 2h): `{r['entry']:.5f}`\nSL: `{r['stop']:.5f}` (1.5xATR) | R: `{r['R']:.5f}`\n{tp_txt}\nSL→BE after TP1, SL→TP1 after TP2\nVol: `{r['vol']:.4f}` | Risk: `${r['risk_money']:.2f}`")
         except Exception as e: logger.error(f"{sym}:{e}")
 
 def check_commands():
@@ -515,8 +505,8 @@ def check_commands():
             t = msg.get("text","").strip()
             if not t.startswith("/"): continue
             p = t.split(); cmd = p[0].lower(); arg = " ".join(p[1:]) if len(p) > 1 else ""
-            if cmd == "/start": send_tg("✅ Hoosha Pro-6E/G v6 live.\nSymbols: EURUSD USDJPY GBPUSD USDCHF XAUUSD XAGUSD US500\nRemoved: BTC USDCAD BRENT\n/status /symbols /perf /calendar /scan /help")
-            elif cmd == "/help": send_tg("/status\n/symbols\n/watch SYM (toggle LIVE/WATCH)\n/perf\n/calendar\n/scan\n/balance 1000\n/risk 0.5\n/interval 30\n/news on|off|status")
+            if cmd == "/start": send_tg("✅ Hoosha Pro-6E/G v6 live.\nSymbols: EURUSD USDJPY GBPUSD USDCHF XAUUSD XAGUSD US500\nRemoved: BTC USDCAD BRENT\n/status /symbols /perf /calendar /scan /test /help")
+            elif cmd == "/help": send_tg("/status\n/symbols\n/watch SYM (toggle LIVE/WATCH)\n/perf\n/calendar\n/scan\n/test\n/balance 100\n/risk 0.5\n/interval 30\n/news on|off|status")
             elif cmd == "/status": send_tg(f"📊 Balance:`{BALANCE}` Risk:`{RISK_PERCENT}%` Interval:`{INTERVAL_MIN}m`\nMode:{'WATCH (demo)' if WATCH_MODE else 'LIVE'}\nNews:{'ON' if NEWS_ENABLED else 'OFF'} ManualPause:{NEWS_MANUAL_PAUSE} Block:{NEWS_BLOCK_MINUTES}m\nTP: 1.3/2.0/3.0R alloc 50/30/20 | SL: 1.5xATR")
             elif cmd == "/symbols": send_tg("\n".join([f"{k}: {v['status']} thr {v['score_thr']} cd {v['cooldown_h']}h | disable:{SYMBOL_SETUP_DISABLE.get(k,[])}" for k,v in PRO6_CFG.items()]) + "\nClass disable: utad_fvg (all)")
             elif cmd == "/watch" and arg:
@@ -537,6 +527,7 @@ def check_commands():
                 elif a == "off": NEWS_MANUAL_PAUSE = False; send_tg("News manual pause OFF, auto still active")
                 else: send_tg(f"Auto:{'ON' if NEWS_ENABLED else 'OFF'} ManualPause:{NEWS_MANUAL_PAUSE} Block:{NEWS_BLOCK_MINUTES}m\n/news on|off\n/calendar")
             elif cmd == "/scan": send_tg("🔎 Force scan..."); scan(); send_tg("Done. /perf for tracking.")
+            elif cmd == "/test": send_tg("✅ Test OK: v6 engine running. Send /scan for force scan.")
     except Exception as e: logger.error(e)
 
 def loop():
