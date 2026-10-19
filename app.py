@@ -1,8 +1,9 @@
 # Hoosha Pro-6E/G + Universal News Filter (30m before/after + auto analysis)
-# LIVE: BTC, USDCAD | DEMO: EURUSD, XAUUSD | WATCH: US500
+# LIVE: EURUSD, USDJPY, GBPUSD, USDCHF, XAUUSD, XAGUSD, US500 (v6 backtest-verified) | Removed: BTC, USDCAD, BRENT
 # News: ForexFactory weekly (faireconomy) High impact, 30m block all symbols + post analysis
-# Not financial advice. Test on demo first.
-import os, time, re, requests, logging, threading
+# Data: Yahoo chart API direct (no yfinance/ccxt) | SL = 1.5xATR | TP 1.3/2.0/3.0R alloc 50/30/20
+# Not financial advice. Test on demo first (WATCH_MODE=1).
+import os, time, re, json, requests, logging, threading
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -13,17 +14,17 @@ logger = logging.getLogger("Pro6News")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PUT_TOKEN")
 TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "PUT_ID"))
-CRYPTO_SYMBOLS = os.getenv("CRYPTO_SYMBOLS", "BTC/USDT").split(",")
-FOREX_SYMBOLS = os.getenv("FOREX_SYMBOLS", "USDCAD=X,EURUSD=X").split(",")
-INDEX_SYMBOLS = os.getenv("INDEX_SYMBOLS", "ES=F").split(",")
-GOLD_SYMBOLS = os.getenv("GOLD_SYMBOLS", "GC=F").split(",")
+FOREX_SYMBOLS = os.getenv("FOREX_SYMBOLS", "EURUSD,USDJPY,GBPUSD,USDCHF").split(",")
+GOLD_SYMBOLS = os.getenv("GOLD_SYMBOLS", "XAUUSD,XAGUSD").split(",")
+INDEX_SYMBOLS = os.getenv("INDEX_SYMBOLS", "US500").split(",")
 BALANCE = float(os.getenv("BALANCE", "1000"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.5"))
-MANUAL_LOT = os.getenv("MANUAL_LOT_OVERRIDE", "")
 INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "30"))
+WATCH_MODE = os.getenv("WATCH_MODE", "0") == "1"   # 1 = demo/watch tags, no live label
 NEWS_ENABLED = os.getenv("NEWS_ENABLED", "1") == "1"
 NEWS_BLOCK_MINUTES = int(os.getenv("NEWS_BLOCK_MINUTES", "30"))
 NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+STATE_FILE = os.getenv("STATE_FILE", "pro6_state.json")
 OFFSET = 0
 NEWS_MANUAL_PAUSE = False
 NEWS_CACHE = []
@@ -31,20 +32,33 @@ NEWS_LAST_FETCH = 0
 WARNED = set()
 ANALYZED = set()
 TRADE_COUNT = {}
+LAST_SIGNAL_TIME = {}
 
+# ---------- v6 backtest-verified config (45d, no spread/slip) ----------
+TP_R = [1.3, 2.0, 3.0]
+TP_ALLOC = [0.5, 0.3, 0.2]
+SL_ATR_MULT = 1.5
+ENTRY_TIMEOUT_MIN = 24 * 5     # 24 M5 bars = 2h
+TRADE_TIMEOUT_MIN = 288 * 5    # 288 M5 bars = 24h
+CLASS_SETUP_DISABLE = {"*": ["utad_fvg"]}                # utad+FVG combo removed everywhere (backtest loser)
+SYMBOL_SETUP_DISABLE = {"GBPUSD": ["utad"], "USDCHF": ["spring"]}
 PRO6_CFG = {
-    "BTCUSD": {"status": "LIVE_CANDIDATE", "score_thr": 55, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "min_tp1_R": 1.3, "sl_buf_ATR": 0.3, "session": "ALL", "max_per_day": 3},
-    "USDCAD": {"status": "LIVE_CANDIDATE", "score_thr": 60, "setups": ["S1","S2","S4"], "htf_filter": "any", "min_tp1_R": 1.3, "sl_buf_ATR": 0.1, "session": "07-17 UTC", "max_per_day": 3},
-    "US500": {"status": "WATCH", "score_thr": 55, "setups": ["S1","S2","S4"], "htf_filter": "aligned", "min_tp1_R": 1.3, "sl_buf_ATR": 0.1, "session": "ALL", "S2_trend_only": True, "max_per_day": 3},
-    "EURUSD": {"status": "LIVE-DEMO", "score_thr": 62, "setups": ["S4","S5"], "htf_filter": "va_fade", "regime": "RANGE", "min_tp1_R": 1.5, "sl_buf_ATR": 0.15, "session": "07-17 UTC", "max_per_day": 1},
-    "XAUUSD": {"status": "LIVE-DEMO", "score_thr": 60, "setups": ["S1","S4"], "htf_filter": "aligned", "regime": "TREND", "min_tp1_R": 1.5, "sl_buf_ATR": 0.35, "session": "12-20 UTC", "max_per_day": 3},
-    "_universal": {"score_thr": 55, "htf_filter": "aligned", "min_tp1_R": 1.3, "sl_buf_ATR": 0.1, "max_per_day": 3},
+    "EURUSD": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "USDJPY": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "GBPUSD": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "USDCHF": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "XAUUSD": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "XAGUSD": {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
+    "US500":  {"status": "LIVE", "score_thr": 50, "setups": ["S1","S2","S4","S5"], "htf_filter": "aligned", "cooldown_h": 4, "max_per_day": 3, "session": "ALL"},
 }
-SYMBOL_CURR = {"BTCUSD": ["USD"], "USDCAD": ["USD","CAD"], "EURUSD": ["USD","EUR"], "XAUUSD": ["USD"], "US500": ["USD"], "UNIVERSAL": ["USD","EUR","CAD"]}
+YAHOO_MAP = {"EURUSD": "EURUSD=X", "USDJPY": "USDJPY=X", "GBPUSD": "GBPUSD=X", "USDCHF": "USDCHF=X",
+             "XAUUSD": "XAUUSD=X", "XAUUSD_FB": "GC=F", "XAGUSD": "XAGUSD=X", "XAGUSD_FB": "SI=F", "US500": "^GSPC"}
+SYMBOL_CURR = {"EURUSD": ["EUR","USD"], "USDJPY": ["USD","JPY"], "GBPUSD": ["GBP","USD"], "USDCHF": ["USD","CHF"],
+               "XAUUSD": ["USD"], "XAGUSD": ["USD"], "US500": ["USD"]}
 
 app = Flask(__name__)
 @app.route("/")
-def home(): return f"OK Hoosha Pro-6 News Alive {datetime.now()}"
+def home(): return f"OK Hoosha Pro-6E/G v6 Alive {datetime.now()}"
 @app.route("/ping")
 def ping(): return "pong"
 
@@ -52,16 +66,14 @@ def send_tg(t):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": t, "parse_mode": "Markdown"}, timeout=15)
     except Exception as e: logger.error(e)
 
+def all_symbols():
+    return [s.strip() for s in FOREX_SYMBOLS+GOLD_SYMBOLS+INDEX_SYMBOLS if s.strip()]
+
 def match_cfg(sym):
-    u = sym.upper()
-    if "EURUSD" in u or "EUR/USD" in u: return "EURUSD", PRO6_CFG["EURUSD"]
-    if "XAU" in u or "GC=F" in u or "GOLD" in u or "PAXG" in u: return "XAUUSD", PRO6_CFG["XAUUSD"]
-    if "BTC" in u: return "BTCUSD", PRO6_CFG["BTCUSD"]
-    if "USDCAD" in u or ("CAD" in u and "USD" in u): return "USDCAD", PRO6_CFG["USDCAD"]
-    if "ES=F" in u or "US500" in u or "SPX" in u or "SPY" in u: return "US500", PRO6_CFG["US500"]
-    if "GBPUSD" in u: return "GBPUSD", {"status": "DISABLED"}
-    if "USDJPY" in u: return "USDJPY", {"status": "DISABLED"}
-    return "UNIVERSAL", PRO6_CFG["_universal"]
+    u = sym.upper().replace("=X","").replace("/","")
+    for name in PRO6_CFG:
+        if name in u: return name, PRO6_CFG[name]
+    return "UNIVERSAL", PRO6_CFG["EURUSD"]
 
 def session_ok(cfg):
     s = cfg.get("session", "ALL")
@@ -71,16 +83,7 @@ def session_ok(cfg):
     if "12-20" in s: return 12 <= h < 20
     return True
 
-def spread_price(sym):
-    u = sym.upper()
-    if "EURUSD" in u: return 0.00008
-    if "USDCAD" in u: return 0.00015
-    if "ES" in u or "US500" in u or "SPX" in u: return 0.5
-    if "BTC" in u: return 20.0
-    if "XAU" in u or "GC" in u or "GOLD" in u: return 0.35
-    return 0.0
-
-# ---------- NEWS ----------
+# ---------- NEWS (unchanged) ----------
 def fetch_news_cached(force=False):
     global NEWS_CACHE, NEWS_LAST_FETCH
     if not force and NEWS_CACHE and time.time()-NEWS_LAST_FETCH < 1800: return NEWS_CACHE
@@ -138,8 +141,8 @@ def analyze_event_text(ev, dt):
         elif any(k in tl for k in ["rate","fomc","federal","powell","interest"]):
             bias = "USD_STRONG" if a >= f else "NEUTRAL"
             reason = "hawkish = strong USD"
-    if bias == "USD_STRONG": impl = "Bearish EURUSD/XAUUSD, Bullish USDCAD, caution long US500/BTC"
-    elif bias == "USD_WEAK": impl = "Bullish EURUSD/XAUUSD, Bearish USDCAD, supportive US500/BTC"
+    if bias == "USD_STRONG": impl = "Bearish EURUSD/GBPUSD/XAUUSD, Bullish USDCHF, caution long US500"
+    elif bias == "USD_WEAK": impl = "Bullish EURUSD/GBPUSD/XAUUSD, Bearish USDCHF, supportive US500"
     else: impl = "Mixed. Wait for trend re-confirmation, no chase."
     return f"📰 *News: {title} ({country})*\nTime: `{dt.strftime('%Y-%m-%d %H:%M')} UTC`\nActual: `{actual}` vs Forecast: `{fore}` Prev: `{prev}`\nVerdict: *{bias}* ({reason})\nImplication: {impl}\nPause {NEWS_BLOCK_MINUTES}m after event still active. Not financial advice."
 
@@ -171,12 +174,10 @@ def upcoming_text():
         if dt and dt > now - timedelta(minutes=30): items.append((dt, ev))
     items = sorted(items, key=lambda x: x[0])[:6]
     if not items: return "No High-Impact events found this week."
-    lines = []
-    for dt, ev in items:
-        lines.append(f"{dt.strftime('%m-%d %H:%M')} UTC - {ev.get('country')} {ev.get('title')}")
+    lines = [f"{dt.strftime('%m-%d %H:%M')} UTC - {ev.get('country')} {ev.get('title')}" for dt, ev in items]
     return "🗓 High-Impact this week:\n" + "\n".join(lines)
 
-# ---------- indicators / data ----------
+# ---------- indicators ----------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def sma(s, n): return s.rolling(n).mean()
 def atr(df, n=14):
@@ -197,30 +198,24 @@ def efficiency_regime(df, n=10, thr=0.3):
     er = abs(c.iloc[-1]-c.iloc[-1-n]) / (c.diff().abs().iloc[-n:].sum() + 1e-9)
     return ("TREND" if er > thr else "RANGE"), float(er)
 
-def fetch_crypto(sym, tf, lim=300):
-    import ccxt
-    ex = ccxt.binance({"enableRateLimit": True})
-    o = ex.fetch_ohlcv(sym, tf, limit=lim)
-    return pd.DataFrame(o, columns=["ts","open","high","low","close","volume"])[["open","high","low","close","volume"]]
-
-def fetch_yf(sym, interval, period="6mo"):
-    import yfinance as yf
-    df = yf.download(sym, period=period, interval=interval, progress=False, auto_adjust=True)
-    if df.empty: raise RuntimeError("no data "+sym)
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    df.columns = [str(c).lower() for c in df.columns]
-    df = df.reset_index(drop=True)
-    m = {}
-    for c in df.columns:
-        lc = c.lower()
-        if "open" in lc: m[c] = "open"
-        elif "high" in lc: m[c] = "high"
-        elif "low" in lc: m[c] = "low"
-        elif "close" in lc and "adj" not in lc: m[c] = "close"
-        elif "volume" in lc: m[c] = "volume"
-    df = df.rename(columns=m)
-    if "volume" not in df.columns or df["volume"].sum() == 0: df["volume"] = 1000.0
-    return df[["open","high","low","close","volume"]].dropna().reset_index(drop=True)
+# ---------- data (Yahoo chart API direct, no yfinance/ccxt) ----------
+def fetch_yahoo(sym, interval, rng):
+    last_err = None
+    for host in ("query1", "query2"):
+        try:
+            url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{sym}"
+            r = requests.get(url, params={"interval": interval, "range": rng, "includePrePost": "false"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            res = r.json()["chart"]["result"][0]
+            ts = res["timestamp"]; q = res["indicators"]["quote"][0]
+            df = pd.DataFrame({"ts": ts, "open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"], "volume": q["volume"]}).dropna().reset_index(drop=True)
+            if len(df) > 30:
+                df["volume"] = df["volume"].fillna(1000.0)
+                if df["volume"].sum() == 0: df["volume"] = 1000.0
+                return df[["open","high","low","close","volume"]]
+            last_err = RuntimeError("short data "+sym)
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else RuntimeError("no data "+sym)
 
 def resample_4h(df1h):
     rows = []
@@ -229,16 +224,20 @@ def resample_4h(df1h):
         rows.append({"open": float(w['open'].iloc[0]), "high": float(w['high'].max()), "low": float(w['low'].min()), "close": float(w['close'].iloc[-1]), "volume": float(w['volume'].sum())})
     return pd.DataFrame(rows)
 
-def get_tf(kind, sym, tf):
-    if kind == "c":
-        mp = {"D1":"1d","H4":"4h","M15":"15m","M5":"5m"}
-        return fetch_crypto(sym, mp.get(tf,"15m"))
-    if tf == "D1": return fetch_yf(sym, "1d", "1y")
-    if tf == "H4": return resample_4h(fetch_yf(sym, "1h", "6mo"))
-    if tf == "M15": return fetch_yf(sym, "15m", "1mo")
-    if tf == "M5": return fetch_yf(sym, "5m", "5d")
-    return fetch_yf(sym, "15m", "1mo")
+def get_tf(base, tf):
+    if tf == "D1": return fetch_yahoo(base, "1d", "1y")
+    if tf == "H4": return resample_4h(fetch_yahoo(base, "1h", "6mo"))
+    if tf == "M15": return fetch_yahoo(base, "15m", "1mo")
+    return fetch_yahoo(base, "5m", "5d")
 
+def fetch_sym_tf(name, tf):
+    try: return get_tf(YAHOO_MAP[name], tf)
+    except Exception:
+        fb = YAHOO_MAP.get(name + "_FB")
+        if fb: return get_tf(fb, tf)
+        raise
+
+# ---------- modules (same as backtest v6) ----------
 def wyckoff_d1(df):
     df = df.copy(); df['atr20'] = atr(df,20); df['volsma'] = sma(df['volume'],20)
     highs, lows = pivots_confirmed(df)
@@ -250,14 +249,14 @@ def wyckoff_d1(df):
     climax = bool(((last5['volume']>2.5*last5['volsma']) & ((last5['close']-last5['open']).abs()>2*last5['atr20'])).any())
     mn = df['low'].iloc[-21:-1].min(); mx = df['high'].iloc[-21:-1].max()
     last = df.iloc[-2] if len(df) > 2 else df.iloc[-1]
-    spring = last['low'] < mn and last['close'] > mn and last['volume'] > 1.5*df['volsma'].iloc[-2]
-    utad = last['high'] > mx and last['close'] < mx and last['volume'] > 1.5*df['volsma'].iloc[-2]
+    spring = bool(last['low'] < mn and last['close'] > mn and last['volume'] > 1.5*df['volsma'].iloc[-2])
+    utad = bool(last['high'] > mx and last['close'] < mx and last['volume'] > 1.5*df['volsma'].iloc[-2])
     score20 = 20 if (spring or utad or bias != "NEUTRAL") else 0
     if spring: phase, bias = "ACCUM", "LONG"
     elif utad: phase, bias = "DISTRIB", "SHORT"
     prev_h = float(df['high'].iloc[-3]) if len(df) > 3 else float(df['high'].iloc[-1])
     prev_l = float(df['low'].iloc[-3]) if len(df) > 3 else float(df['low'].iloc[-1])
-    return {"bias":bias,"phase":phase,"climax":bool(climax),"score":score20,"prev_h":prev_h,"prev_l":prev_l}
+    return {"bias":bias,"phase":phase,"climax":climax,"score":score20,"prev_h":prev_h,"prev_l":prev_l,"spring":spring,"utad":utad}
 
 def h4_module(df):
     df = df.copy(); df['ema20'] = ema(df['close'],20); df['atr'] = atr(df,14)
@@ -324,38 +323,41 @@ def detect_setup(df15, h4, s15, no_vol=False):
     body_ok = bool(abs(row['close']-row['open']) >= 0.6*(row['high']-row['low']))
     return {"sig":sig,"type":stype,"in_zone":in_zone(row['close']),"vol_ok":vol_ok,"body_ok":body_ok,"atr15":float(df['atr'].iloc[i])}
 
-def build_signal(kind, sym):
+# ---------- v6 setup filters (token matching fixed: event + combo) ----------
+def setup_allowed(name, prefix, event):
+    token = f"{prefix}_{event}" if event != "none" else prefix
+    for bad in CLASS_SETUP_DISABLE.get("*", []):
+        if token == bad or prefix == bad: return False
+    for b in SYMBOL_SETUP_DISABLE.get(name, []):
+        if b == event or b == prefix or b == token: return False
+    return True
+
+def build_signal(sym):
     name, cfg = match_cfg(sym)
-    if cfg.get("status") == "DISABLED": return None
     blocked, ev = is_news_blocked_for(name)
     if blocked:
         logger.info(f"{sym} news-blocked: {ev.get('title')}")
         return None
     if not session_ok(cfg):
         logger.info(f"{sym} skipped session"); return None
-    is_index = ("ES" in sym.upper() or "US500" in sym.upper() or "SPX" in sym.upper())
-    is_gold = ("XAU" in sym.upper() or "GC" in sym.upper() or "GOLD" in sym.upper())
-    no_vol = is_index or is_gold
-    d1 = get_tf(kind,sym,"D1"); h4 = get_tf(kind,sym,"H4"); m15 = get_tf(kind,sym,"M15"); m5 = get_tf(kind,sym,"M5")
-    wk = wyckoff_d1(d1); h = h4_module(h4); s15 = smc_m15(m15)
+    is_index = name == "US500"
+    no_vol = is_index or name in ("XAUUSD","XAGUSD")
+    d1 = fetch_sym_tf(name,"D1"); h4d = fetch_sym_tf(name,"H4"); m15 = fetch_sym_tf(name,"M15"); m5 = fetch_sym_tf(name,"M5")
+    wk = wyckoff_d1(d1); h = h4_module(h4d); s15 = smc_m15(m15)
     st = detect_setup(m15,h,s15,no_vol)
     direction = st["sig"]
     if direction == "HOLD": return None
     prefix = st["type"].split("_")[0]
-    if prefix not in cfg.get("setups", ["S1","S2","S4"]): return None
+    event = "spring" if wk["spring"] else "utad" if wk["utad"] else "none"
+    if prefix not in cfg.get("setups", ["S1","S2","S4","S5"]): return None
+    if not setup_allowed(name, prefix, event): return None
     if prefix == "S2" and h["regime"] != "TREND": return None
-    req_reg = cfg.get("regime")
-    if req_reg and h["regime"] != req_reg: return None
-    hf = cfg.get("htf_filter", "aligned")
-    if h["va_bias"] == "MID": return None
-    if wk["climax"]: return None
-    if hf == "aligned":
+    if cfg.get("htf_filter") == "aligned":
+        if h["va_bias"] == "MID": return None
+        if wk["climax"]: return None
         if wk["bias"] != "NEUTRAL" and wk["bias"] != direction: return None
         if h["ai"] != "NEUTRAL" and h["ai"] != direction: return None
         if wk["bias"] == "NEUTRAL" and h["ai"] == "NEUTRAL": return None
-    elif hf == "va_fade":
-        if direction == "LONG" and h["va_bias"] != "BELOW": return None
-        if direction == "SHORT" and h["va_bias"] != "ABOVE": return None
     score = 0
     score += wk["score"]
     if h["ai"] == direction: score += 15
@@ -363,67 +365,147 @@ def build_signal(kind, sym):
     if any(abs(m15['close'].iloc[-2]-z) < 0.5*h["atr"] for z in h["levels"]+[h["vah"],h["val"],h["poc"]]): score += 15
     if st["vol_ok"] and st["body_ok"]: score += 15
     if st["vol_ok"] and st["body_ok"] and st["in_zone"] and h["ai"] == direction: score += 15
-    if score < cfg.get("score_thr",55): return None
-    if name == "EURUSD":
-        c1 = m5.iloc[-2]; c2 = m5.iloc[-3]
-        if direction == "LONG" and not (c1['close'] > c1['open'] and c2['close'] > c2['open']): return None
-        if direction == "SHORT" and not (c1['close'] < c1['open'] and c2['close'] < c2['open']): return None
+    if score < cfg.get("score_thr",50): return None
+    # v6 execution model: stop-order entry on signal candle, SL = 1.5xATR(M5), fixed TP 1.3/2.0/3.0R
     sig_c = m5.iloc[-2]; atr5 = float(atr(m5,14).iloc[-2])
-    buf = cfg.get("sl_buf_ATR",0.1) * st["atr15"]
-    spr = spread_price(sym)/2.0
     if direction == "LONG":
-        entry = float(sig_c['high'] + spr); stop = float(sig_c['low'] - buf - spr); stop = min(stop, entry - 0.5*atr5)
+        entry = float(sig_c['high']); stop = entry - SL_ATR_MULT*atr5
     else:
-        entry = float(sig_c['low'] - spr); stop = float(sig_c['high'] + buf + spr); stop = max(stop, entry + 0.5*atr5)
-    R = abs(entry-stop)+1e-9
-    cands = []
-    for f in s15["fvgs"]:
-        if direction == "LONG" and f["edge"] > entry: cands.append((f["edge"],"FVG_edge"))
-        if direction == "SHORT" and f["edge"] < entry: cands.append((f["edge"],"FVG_edge"))
-    for oL,oH in s15["obs"]:
-        lvl = oL if direction == "LONG" else oH
-        if (direction == "LONG" and lvl > entry) or (direction == "SHORT" and lvl < entry): cands.append((lvl,"OB"))
-    for lvl in [h["poc"],h["vah"],h["val"]]+h["levels"]+h["piv_h"]+h["piv_l"]+[wk["prev_h"],wk["prev_l"]]+s15["piv_h"]+s15["piv_l"]:
-        if (direction == "LONG" and lvl > entry) or (direction == "SHORT" and lvl < entry): cands.append((float(lvl),"Profile/Classic"))
-    cands = sorted(cands, key=lambda x: abs(x[0]-entry))
-    filt = []
-    for p,src in cands:
-        if not filt or abs(p-filt[-1][0]) > 0.2*R: filt.append((p,src))
-        if len(filt) >= 3: break
-    if not filt: return None
-    while len(filt) < 3: filt.append(filt[-1])
-    if abs(filt[0][0]-entry)/R < cfg.get("min_tp1_R",1.3): return None
+        entry = float(sig_c['low']); stop = entry + SL_ATR_MULT*atr5
+    rd = abs(entry-stop)
+    if rd <= 0: return None
+    tps = [entry + (TP_R[i]*rd if direction == "LONG" else -TP_R[i]*rd) for i in range(3)]
     risk_money = BALANCE*(RISK_PERCENT/100)
-    vol = risk_money/R
-    if MANUAL_LOT.strip() != "":
-        try: vol = float(MANUAL_LOT)
-        except: pass
-    return {"symbol":sym,"map":name,"signal":direction,"score":score,"wyckoff":wk,"ai_H4":h["ai"],"regime":h["regime"],"setup":st["type"],"entry":entry,"stop":stop,"R":R,"vol":vol,"risk_money":risk_money,"tps":filt,"poc":h["poc"],"vah":h["vah"],"val":h["val"],"status":cfg.get("status","LIVE")}
+    vol = risk_money/rd
+    return {"symbol":sym,"map":name,"signal":direction,"score":score,"event":event,"wyckoff":wk,"ai_H4":h["ai"],
+            "regime":h["regime"],"setup":st["type"],"entry":entry,"stop":stop,"R":rd,"tps":tps,"vol":vol,
+            "risk_money":risk_money,"status":("WATCH" if WATCH_MODE else cfg.get("status","LIVE"))}
 
-def scan(force=False):
-    jobs = [("c",s) for s in CRYPTO_SYMBOLS if s.strip()]+[("f",s) for s in FOREX_SYMBOLS if s.strip()]+[("f",s) for s in INDEX_SYMBOLS if s.strip()]+[("f",s) for s in GOLD_SYMBOLS if s.strip()]
+# ---------- trade tracking (pro6_state.json) ----------
+def load_state():
+    try:
+        with open(STATE_FILE) as f: st = json.load(f)
+        st.setdefault("open", []); st.setdefault("closed", [])
+        return st
+    except Exception:
+        return {"open": [], "closed": []}
+
+def save_state(st):
+    try:
+        with open(STATE_FILE,"w") as f: json.dump(st, f)
+    except Exception as e: logger.error(f"state save: {e}")
+
+def register_trade(r):
+    st = load_state()
+    st["open"].append({"id": f"{r['map']}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", "map": r["map"], "symbol": r["symbol"],
+        "dir": r["signal"], "setup": r["setup"], "event": r["event"], "score": r["score"], "entry": r["entry"], "sl": r["stop"],
+        "R": r["R"], "tps": r["tps"], "stage": 0, "realized_r": 0.0, "entered": False,
+        "opened_at": datetime.now(timezone.utc).isoformat(), "status": r["status"]})
+    save_state(st)
+
+def fmt(t): return f"{t['dir']} {t['symbol']} [{t['status']}]"
+
+def monitor_trades():
+    st = load_state()
+    now = datetime.now(timezone.utc)
+    for t in st["open"][:]:
+        try: m5 = fetch_sym_tf(t["map"], "M5")
+        except Exception as e:
+            logger.error(f"monitor {t['map']}: {e}"); continue
+        opened = datetime.fromisoformat(t["opened_at"])
+        age_min = (now - opened).total_seconds()/60
+        # pending stop-order entry, valid 24 M5 bars
+        if not t["entered"]:
+            if age_min > ENTRY_TIMEOUT_MIN:
+                st["open"].remove(t); st["closed"].append({**t, "result_r": 0.0, "why": "entry timeout"})
+                send_tg(f"⌛ Cancelled (entry not hit in 2h): {fmt(t)}")
+                save_state(st); continue
+            hit = (m5['high'].max() >= t["entry"]) if t["dir"] == "LONG" else (m5['low'].min() <= t["entry"])
+            if hit:
+                t["entered"] = True
+                send_tg(f"✅ Entry filled: {fmt(t)} @ `{t['entry']:.5f}`\nSL `{t['sl']:.5f}` | TP1/2/3 active (50/30/20)")
+                save_state(st)
+            continue
+        # active trade: walk recent bars, SL-first (conservative)
+        rec = m5.tail(60)
+        closed = False
+        for _, bar in rec.iterrows():
+            if t["dir"] == "LONG":
+                if bar['low'] <= t["sl"]:
+                    frac_left = 1.0 - sum(TP_ALLOC[:t["stage"]])
+                    exit_px = t["sl"]
+                    t["realized_r"] += frac_left * ((exit_px - t["entry"])/t["R"] if t["dir"] == "LONG" else (t["entry"] - exit_px)/t["R"])
+                    st["open"].remove(t); st["closed"].append({**t, "result_r": round(t["realized_r"],3), "why": "SL", "closed_at": now.isoformat()})
+                    send_tg(f"🛑 SL hit: {fmt(t)} | Result: `{t['realized_r']:+.2f}R`"); closed = True; break
+                if t["stage"] < 3 and bar['high'] >= t["tps"][t["stage"]]:
+                    t["realized_r"] += TP_ALLOC[t["stage"]] * TP_R[t["stage"]]
+                    t["stage"] += 1
+                    if t["stage"] == 1: t["sl"] = t["entry"]
+                    elif t["stage"] == 2: t["sl"] = t["tps"][0]
+                    send_tg(f"🎯 TP{t['stage']} hit: {fmt(t)} | `{t['realized_r']:+.2f}R` so far | SL → `{t['sl']:.5f}`")
+                    if t["stage"] == 3:
+                        st["open"].remove(t); st["closed"].append({**t, "result_r": round(t["realized_r"],3), "why": "TP3", "closed_at": now.isoformat()})
+                        send_tg(f"🏁 Closed full: {fmt(t)} | Final: `{t['realized_r']:+.2f}R`"); closed = True; break
+            else:
+                if bar['high'] >= t["sl"]:
+                    frac_left = 1.0 - sum(TP_ALLOC[:t["stage"]])
+                    exit_px = t["sl"]
+                    t["realized_r"] += frac_left * ((t["entry"] - exit_px)/t["R"])
+                    st["open"].remove(t); st["closed"].append({**t, "result_r": round(t["realized_r"],3), "why": "SL", "closed_at": now.isoformat()})
+                    send_tg(f"🛑 SL hit: {fmt(t)} | Result: `{t['realized_r']:+.2f}R`"); closed = True; break
+                if t["stage"] < 3 and bar['low'] <= t["tps"][t["stage"]]:
+                    t["realized_r"] += TP_ALLOC[t["stage"]] * TP_R[t["stage"]]
+                    t["stage"] += 1
+                    if t["stage"] == 1: t["sl"] = t["entry"]
+                    elif t["stage"] == 2: t["sl"] = t["tps"][0]
+                    send_tg(f"🎯 TP{t['stage']} hit: {fmt(t)} | `{t['realized_r']:+.2f}R` so far | SL → `{t['sl']:.5f}`")
+                    if t["stage"] == 3:
+                        st["open"].remove(t); st["closed"].append({**t, "result_r": round(t["realized_r"],3), "why": "TP3", "closed_at": now.isoformat()})
+                        send_tg(f"🏁 Closed full: {fmt(t)} | Final: `{t['realized_r']:+.2f}R`"); closed = True; break
+        if closed: save_state(st); continue
+        if age_min > TRADE_TIMEOUT_MIN:
+            lastc = float(m5['close'].iloc[-1])
+            frac_left = 1.0 - sum(TP_ALLOC[:t["stage"]])
+            t["realized_r"] += frac_left * ((lastc - t["entry"])/t["R"] if t["dir"] == "LONG" else (t["entry"] - lastc)/t["R"])
+            st["open"].remove(t); st["closed"].append({**t, "result_r": round(t["realized_r"],3), "why": "timeout", "closed_at": now.isoformat()})
+            send_tg(f"⏱ Timeout close (24h): {fmt(t)} | Result: `{t['realized_r']:+.2f}R`")
+            save_state(st); continue
+        save_state(st)
+
+def perf_text():
+    st = load_state()
+    cl = st["closed"]
+    if not cl: return "No closed trades yet."
+    rs = [c.get("result_r",0.0) for c in cl]
+    wins = [r for r in rs if r > 0]
+    tot = sum(rs)
+    return (f"📊 *Perf (live-tracked)*\nClosed: `{len(cl)}` | Winrate: `{len(wins)}/{len(cl)} ({100*len(wins)/len(cl):.0f}%)`\nTotal: `{tot:+.2f}R` | Expectancy: `{tot/len(cl):+.3f}R`\nOpen: `{len(st['open'])}`\nReference backtest v6: +71.3R/45d on 7 symbols.")
+
+def scan():
     today = datetime.now(timezone.utc).date().isoformat()
-    for kind,sym in jobs:
-        sym = sym.strip()
-        if not sym: continue
+    now = datetime.now(timezone.utc)
+    for sym in all_symbols():
         name,cfg = match_cfg(sym)
-        if cfg.get("status") == "DISABLED":
-            logger.info(f"{sym} DISABLED skip"); continue
         maxd = int(cfg.get("max_per_day",3))
         key = f"{sym}-{today}"
         if TRADE_COUNT.get(key,0) >= maxd:
             logger.info(f"{sym} max {maxd}/day skip"); continue
+        last_t = LAST_SIGNAL_TIME.get(name)
+        if last_t and (now-last_t).total_seconds() < cfg.get("cooldown_h",4)*3600:
+            logger.info(f"{sym} cooldown skip"); continue
         try:
-            r = build_signal(kind,sym)
+            r = build_signal(sym)
             logger.info(f"{sym} -> {r['signal']+' '+str(r['score']) if r else 'HOLD'}")
             if r:
                 TRADE_COUNT[key] = TRADE_COUNT.get(key,0)+1
-                tp_txt = "\n".join([f"TP{i+1} `{p[0]:.5f}` ({p[1]})" for i,p in enumerate(r['tps'])])
-                send_tg(f"🎯 *{r['signal']} {sym} [{r['status']}] | Score {r['score']}*\nSetup: `{r['setup']}`\nWyckoff: {r['wyckoff']['phase']} | H4:{r['ai_H4']} {r['regime']}\nEntry(stop): `{r['entry']:.5f}`\nSL: `{r['stop']:.5f}` R:`{r['R']:.5f}`\nVol: `{r['vol']:.4f}` Risk: `${r['risk_money']:.2f}`\n{tp_txt}\nAlloc 50/30/20 | BE after TP1, SL to TP1 after TP2\nPOC:`{r['poc']:.5f}` VAH:`{r['vah']:.5f}` VAL:`{r['val']:.5f}`")
+                LAST_SIGNAL_TIME[name] = now
+                register_trade(r)
+                tp_txt = "\n".join([f"TP{i+1} `{r['tps'][i]:.5f}` ({TP_R[i]}R, {int(TP_ALLOC[i]*100)}%)" for i in range(3)])
+                send_tg(f"🎯 *{r['signal']} {r['symbol']} [{r['status']}] | Score {r['score']}*\nSetup: `{r['setup']}` | Event: `{r['event']}`\nWyckoff: {r['wyckoff']['phase']} | H4:{r['ai_H4']} {r['regime']}\nEntry(stop-order, valid 2h): `{r['entry']:.5f}`\nSL: `{r['stop']:.5f}` (1.5xATR) | R: `{r['R']:.5f}`\n{tp_txt}\nSL→BE after TP1, SL→TP1 after TP2\nVol: `{r['vol']:.4f}` | Risk: `${r['risk_money']:.2f}`\nPOC:`{PRO6_CFG and 0:.1f}`".replace("POC:`0.0`",""))
         except Exception as e: logger.error(f"{sym}:{e}")
 
 def check_commands():
-    global OFFSET, BALANCE, RISK_PERCENT, INTERVAL_MIN, CRYPTO_SYMBOLS, FOREX_SYMBOLS, INDEX_SYMBOLS, GOLD_SYMBOLS, MANUAL_LOT, NEWS_MANUAL_PAUSE
+    global OFFSET, BALANCE, RISK_PERCENT, INTERVAL_MIN, NEWS_MANUAL_PAUSE, WATCH_MODE
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates", params={"offset":OFFSET,"timeout":5}, timeout=15).json()
         for u in r.get("result",[]):
@@ -433,32 +515,43 @@ def check_commands():
             t = msg.get("text","").strip()
             if not t.startswith("/"): continue
             p = t.split(); cmd = p[0].lower(); arg = " ".join(p[1:]) if len(p) > 1 else ""
-            if cmd == "/start": send_tg("✅ Hoosha Pro-6 News live.\n/status\n/config\n/calendar\n/scan\n/news status")
-            elif cmd == "/help": send_tg("/status\n/config\n/calendar\n/balance 1000\n/risk 0.5\n/lot auto\n/scan\n/news on|off|status\n/interval 30")
-            elif cmd == "/status": send_tg(f"📊 Balance:`{BALANCE}` Risk:`{RISK_PERCENT}%` Lot:`{MANUAL_LOT or 'auto'}`\nCrypto:{','.join(CRYPTO_SYMBOLS)}\nForex:{','.join(FOREX_SYMBOLS)}\nIndex:{','.join(INDEX_SYMBOLS)}\nGold:{','.join(GOLD_SYMBOLS)}\nNews:{'ON' if NEWS_ENABLED else 'OFF'} ManualPause:{NEWS_MANUAL_PAUSE} Block:{NEWS_BLOCK_MINUTES}m")
-            elif cmd == "/config": send_tg("BTCUSD LIVE 55 ALL aligned\nUSDCAD LIVE 60 S1,S2,S4 any 07-17UTC\nUS500 WATCH 55\nEURUSD DEMO 62 S4,S5 va_fade RANGE\nXAUUSD DEMO 60 S1,S4 TREND\nNews: 30m block ALL + auto analysis")
+            if cmd == "/start": send_tg("✅ Hoosha Pro-6E/G v6 live.\nSymbols: EURUSD USDJPY GBPUSD USDCHF XAUUSD XAGUSD US500\nRemoved: BTC USDCAD BRENT\n/status /symbols /perf /calendar /scan /help")
+            elif cmd == "/help": send_tg("/status\n/symbols\n/watch SYM (toggle LIVE/WATCH)\n/perf\n/calendar\n/scan\n/balance 1000\n/risk 0.5\n/interval 30\n/news on|off|status")
+            elif cmd == "/status": send_tg(f"📊 Balance:`{BALANCE}` Risk:`{RISK_PERCENT}%` Interval:`{INTERVAL_MIN}m`\nMode:{'WATCH (demo)' if WATCH_MODE else 'LIVE'}\nNews:{'ON' if NEWS_ENABLED else 'OFF'} ManualPause:{NEWS_MANUAL_PAUSE} Block:{NEWS_BLOCK_MINUTES}m\nTP: 1.3/2.0/3.0R alloc 50/30/20 | SL: 1.5xATR")
+            elif cmd == "/symbols": send_tg("\n".join([f"{k}: {v['status']} thr {v['score_thr']} cd {v['cooldown_h']}h | disable:{SYMBOL_SETUP_DISABLE.get(k,[])}" for k,v in PRO6_CFG.items()]) + "\nClass disable: utad_fvg (all)")
+            elif cmd == "/watch" and arg:
+                nm = arg.upper(); found = False
+                for k in PRO6_CFG:
+                    if k in nm or nm in k:
+                        PRO6_CFG[k]["status"] = "WATCH" if PRO6_CFG[k]["status"] != "WATCH" else "LIVE"
+                        send_tg(f"{k} → {PRO6_CFG[k]['status']}"); found = True
+                if not found: send_tg("Symbol not found. Try /symbols")
+            elif cmd == "/perf": send_tg(perf_text())
             elif cmd == "/calendar": send_tg(upcoming_text())
             elif cmd == "/balance" and arg: BALANCE = float(arg); send_tg(f"Balance set: `{BALANCE}`")
             elif cmd == "/risk" and arg: RISK_PERCENT = float(arg); send_tg(f"Risk set: `{RISK_PERCENT}%`")
-            elif cmd == "/lot" and arg: MANUAL_LOT = "" if arg == "auto" else arg; send_tg(f"Lot: `{MANUAL_LOT or 'auto'}`")
             elif cmd == "/interval" and arg: INTERVAL_MIN = int(arg); send_tg(f"Interval `{INTERVAL_MIN}m`")
             elif cmd == "/news":
                 a = arg.lower()
                 if a == "on": NEWS_MANUAL_PAUSE = True; send_tg("News manual pause ON")
                 elif a == "off": NEWS_MANUAL_PAUSE = False; send_tg("News manual pause OFF, auto still active")
                 else: send_tg(f"Auto:{'ON' if NEWS_ENABLED else 'OFF'} ManualPause:{NEWS_MANUAL_PAUSE} Block:{NEWS_BLOCK_MINUTES}m\n/news on|off\n/calendar")
-            elif cmd == "/scan": send_tg("🔎 Force scan..."); scan(force=True); send_tg("Done.")
-            elif cmd == "/test": send_tg("✅ Test OK. Send /calendar for news, /scan for scan.")
+            elif cmd == "/scan": send_tg("🔎 Force scan..."); scan(); send_tg("Done. /perf for tracking.")
     except Exception as e: logger.error(e)
 
 def loop():
-    send_tg("✅ Hoosha Pro-6 News started. 30m news block ALL + auto analysis. Send /calendar")
+    send_tg("✅ Hoosha Pro-6E/G v6 started.\nLIVE: EURUSD USDJPY GBPUSD USDCHF XAUUSD XAGUSD US500\nNews 30m block ALL + auto analysis. Send /calendar")
     fetch_news_cached(force=True)
-    last = 0; last_news = 0
+    last = 0; last_news = 0; last_mon = 0
     while True:
         check_commands()
         if time.time()-last_news > 300:
             check_news_alerts(); last_news = time.time()
+        if time.time()-last_mon > 300:
+            monitor_trades(); last_mon = time.time()
         if time.time()-last >= INTERVAL_MIN*60: scan(); last = time.time()
         time.sleep(10)
+
 threading.Thread(target=loop, daemon=True).start()
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
