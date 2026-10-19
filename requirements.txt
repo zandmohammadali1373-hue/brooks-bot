@@ -1,7 +1,5 @@
-flask
-gunicorn
-ccxt
-yfinance
-pandas
-numpy
-requests
+Flask==3.0.3
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
+gunicorn==22.0.0
